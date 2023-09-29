@@ -35,15 +35,18 @@ export async function installedCheck (options) {
     engineNoDev = false,
     path = '.',
     versionCheck = false,
+    traverseWorkspaces = true,
   } = options;
 
   if (!engineCheck && !versionCheck) {
     throw new Error('Expected to run at least one check. Add engineCheck and/or versionCheck');
   }
 
+  const checks = [];
+
   const [
     mainPackage,
-    installedDependencies,
+    mainInstalledDependencies,
   ] = await Promise.all([
     readPackage({ cwd: path }).catch(/** @param {Error} err */ err => {
       throw new ErrorWithCause('Failed to read package.json', { cause: err });
@@ -53,8 +56,43 @@ export async function installedCheck (options) {
     }),
   ]);
 
-  const requiredDependencies = Object.assign({}, mainPackage.dependencies || {}, mainPackage.devDependencies || {});
-  const optionalDependencies = Object.assign({}, mainPackage.optionalDependencies || {});
+  const mainRequiredDependencies = Object.assign({}, mainPackage.dependencies || {}, mainPackage.devDependencies || {});
+  const mainOptionalDependencies = Object.assign({}, mainPackage.optionalDependencies || {});
+
+  checks.push({
+    engines: mainPackage.engines || {},
+    dependencies: mainPackage.dependencies || {},
+    requiredDependencies: mainRequiredDependencies,
+    optionalDependencies: mainOptionalDependencies,
+    installedDependencies: mainInstalledDependencies
+  });
+
+  if (traverseWorkspaces && mainPackage.workspaces) {
+    await Promise.all(
+      // TODO dedupe root dir more accurately
+      mainPackage.workspaces.filter(w => w !== '.').map(w => {
+        // TODO create subpath more accurately
+        const subpath = path + '/' + w;
+        return Promise.all([
+          readPackage({ cwd: subpath }).catch(/** @param {Error} err */ err => {
+            throw new ErrorWithCause('Failed to read workspace package.json', { cause: err });
+          }),
+          listInstalled(subpath).catch(() => (new Map()))
+        ]).then(([subPackage, subInstalled]) => {
+          const installedDependencies = new Map(mainInstalledDependencies);
+          subInstalled.forEach((value, key) => installedDependencies.set(key, value));
+          checks.push({
+            subpath,
+            engines: subPackage.engines || mainPackage.engines || {},
+            dependencies: subPackage.dependencies || mainPackage.dependencies || {},
+            requiredDependencies: Object.assign({}, subPackage.dependencies || {}, subPackage.devDependencies || {}),
+            optionalDependencies: Object.assign({}, subPackage.optionalDependencies || {}),
+            installedDependencies,
+          });
+        });
+      })
+    );
+  }
 
   /** @type {string[]} */
   let errors = [];
@@ -62,28 +100,31 @@ export async function installedCheck (options) {
   let warnings = [];
 
   if (versionCheck) {
-    const packageResult = checkPackageVersions(requiredDependencies, installedDependencies, optionalDependencies);
-
-    errors = [...errors, ...packageResult.errors];
-    warnings = [...warnings, ...packageResult.warnings];
+    checks.forEach((check) => {
+      const packageResult = checkPackageVersions(check.requiredDependencies, check.installedDependencies, check.optionalDependencies);
+      errors = [...errors, ...packageResult.errors.map(str => check.subpath ? '[' + check.subpath + '] ' + str : str)];
+      warnings = [...warnings, ...packageResult.warnings.map(str => check.subpath ? '[' + check.subpath + '] ' + str : str)];
+    });
   }
 
   if (engineCheck) {
-    const dependencies = Object.assign({}, engineNoDev ? mainPackage.dependencies : requiredDependencies);
+    checks.forEach((check) => {
+      const dependencies = Object.assign({}, engineNoDev ? check.dependencies : check.requiredDependencies);
 
-    for (const name of (engineIgnores || [])) {
-      delete dependencies[name];
-    }
+      for (const name of (engineIgnores || [])) {
+        delete dependencies[name];
+      }
 
-    const engineResult = checkEngineVersions(
-      mainPackage.engines || {},
-      dependencies,
-      installedDependencies,
-      optionalDependencies
-    );
+      const engineResult = checkEngineVersions(
+        check.engines,
+        dependencies,
+        check.installedDependencies,
+        check.optionalDependencies
+      );
 
-    errors = [...errors, ...engineResult.errors];
-    warnings = [...warnings, ...engineResult.warnings];
+      errors = [...errors, ...engineResult.errors.map(str => check.subpath ? '[' + check.subpath + '] ' + str : str)];
+      warnings = [...warnings, ...engineResult.warnings.map(str => check.subpath ? '[' + check.subpath + '] ' + str : str)];
+    });
   }
 
   return { errors, warnings, notices: [] };
